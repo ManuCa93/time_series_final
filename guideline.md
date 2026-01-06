@@ -54,3 +54,31 @@ Forecast 24 hours ahead at hourly resolution.
 ## Dataset:
 
 **ev_dataset.csv**
+
+
+
+# General information
+
+For the final challenge you’re request to form **groups of 2-3 persons** and hand in a time series analysis and forecasting pipeline.
+
+1. Chose a dataset among the proposed one
+2. For the chosen dataset, forecast the target through the following steps:
+    1. EXPLORATORY ANALYSIS. E.g. data plotting, correlation plots, ACF, etc..
+    2. MODEL BUILDING. E.g. check stationarity, transform, choose model & fit, check residuals
+    3. CV and model SELECTION. 
+    4. Presentation of results
+
+Keep your code:
+
+- **Clean and well-organized**
+- **Efficient** – avoid extremely long runtimes; (if it takes 1 hour to run assume it is not usable, alternatively, warn the user and explain very well why it should take so long)
+- **Commented** – your code should be easy to understand without guessing.
+- **Short -** Chatgpt implementations tend to be long, I would like to correct **your** code ****
+
+### Deadline
+
+- *You can hand in a notebook or (extensively) commented **running** code, by **Jan 19 2026***
+
+### Hard filter
+
+- **Your best model performing worse than naive persistent is sufficient condition for failing the exam**

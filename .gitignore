@@ -8,3 +8,8 @@ __pycache__/
 
 .ds_store
 .DS_Store
+
+.venv/
+venv/
+env/
+ENV/

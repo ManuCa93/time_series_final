@@ -3,13 +3,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.metrics import mean_absolute_error
 from tqdm import tqdm
-
-# Handle Chronos import gracefully for environments where it isn't installed
-try:
-    from chronos import BaseChronosPipeline
-except ImportError:
-    BaseChronosPipeline = None
-    print("Warning: 'chronos' library not found. Chronos-related functions will not work.")
+from chronos import BaseChronosPipeline
 
 # ============================================================================
 # BASIC UTILS & BENCHMARK MODELS
@@ -18,15 +12,18 @@ except ImportError:
 def cast_df(y, df):
     """Helper to format forecast arrays into timestamps DataFrames."""
     h = len(y)
-    return pd.DataFrame(y, index=pd.date_range(
-        start=df.index[-1] + pd.Timedelta(hours=1), periods=h, freq='h'))
+    # Create a new DatetimeIndex starting 1 hour after the last observed timestamp
+    # This aligns the forecast values with the future time range
+    return pd.DataFrame(y, index=pd.date_range(start=df.index[-1] + pd.Timedelta(hours=1), periods=h, freq='h'))
 
 def naive(x, h): 
     """Naive Forecast: Uses the last observed value."""
+    # Simply repeat the last value of the series 'h' times
     return cast_df(np.repeat(x.iloc[-1], h), x)
 
 def mean_fc(x, h): 
     """Mean Forecast: Uses the historical mean."""
+    # Repeat the mean of the training data 'h' times
     return cast_df(np.repeat(x.mean(), h), x)
 
 def seasonal_naive(x, h, m=24):
@@ -34,7 +31,10 @@ def seasonal_naive(x, h, m=24):
     Seasonal Naive Forecast.
     Repeats the last 'm' periods (default 24h for daily seasonality).
     """
+    # Extract the last cycle (e.g., last 24 hours)
     values = x.iloc[-m:].values
+    # Tile (repeat) this cycle enough times to cover the forecast horizon 'h'
+    # Slice [:h] to ensure we return exactly 'h' steps
     y_hat = np.tile(values, int(np.ceil(h/m)))[:h]
     return cast_df(y_hat, x)
 
@@ -43,7 +43,9 @@ def calculate_nmae(y_true, y_pred, y_train_mean):
     Calculates Normalized Mean Absolute Error (nMAE).
     Normalized by the MAE of a naive baseline (mean forecast).
     """
+    # Standard Mean Absolute Error of the model
     mae = np.mean(np.abs(y_true - y_pred))
+    # MAE of a baseline model that always predicts the mean of the test set
     mae_baseline = np.mean(np.abs(y_true - np.mean(y_true)))  
     return mae / mae_baseline if mae_baseline != 0 else np.nan
 
@@ -54,21 +56,23 @@ def rolling_window_cv(ts_series, model_func, h_ahead=24, n_splits=10):
     """
     results = {'mae': [], 'nmae': [], 'actuals': [], 'forecasts': []}
     
-    # Calculate step size to ensure we use the whole dataset
+    # Calculate step size (stride) to ensure we utilize the entire dataset across n_splits
+    # We work backwards from the end of the series
     step = (len(ts_series) - h_ahead) // (n_splits + 1)
     
     for i in range(n_splits):
+        # Define the end of the training set for this fold
+        # As i increases, train_end_idx increases (expanding window)
         train_end_idx = len(ts_series) - h_ahead - (n_splits - i) * step
+        
         train = ts_series.iloc[:train_end_idx]
         test = ts_series.iloc[train_end_idx:train_end_idx + h_ahead]
         
-        # Skip incomplete folds
-        if len(test) < h_ahead:
-            continue
-        
+        # Generate forecast and flatten to 1D array
         y_pred = model_func(train, h_ahead).values.ravel()
         y_true = test.values
         
+        # Compute metrics for this fold
         mae = np.mean(np.abs(y_true - y_pred))
         nmae = calculate_nmae(y_true, y_pred, train.mean())
         
@@ -86,25 +90,27 @@ def rolling_window_cv(ts_series, model_func, h_ahead=24, n_splits=10):
 def benchmark_per_rail(ts_data, target_name, split_date='2023-03-15 23:00:00', h_ahead=24):
     """
     Iterates through each rail (column) and computes benchmark metrics.
+    Useful for seeing which specific rails are hard to predict.
     """
     print(f"BENCHMARK NAIVE - {target_name.upper()}")
     
     bench_results = {}
     split_datetime = pd.to_datetime(split_date)
     
+    # Iterate over every column (rail/station) in the dataframe
     for rail in ts_data.columns:
         ts = ts_data[rail]
+        # Split data into train/test based on date
         train = ts.loc[:split_date]
         test = ts.loc[split_datetime + pd.Timedelta(hours=1):].iloc[:h_ahead]
         
-        if len(test) < h_ahead:
-            continue
-        
         y_true = test.values
+        # Generate all 3 benchmark forecasts
         y_naive = naive(train, h_ahead).values.ravel()
         y_mean = mean_fc(train, h_ahead).values.ravel()
         y_snai = seasonal_naive(train, h_ahead).values.ravel()
         
+        # Calculate nMAE for each method
         bench_results[rail] = {
             'Naive': calculate_nmae(y_true, y_naive, train.mean()),
             'Mean': calculate_nmae(y_true, y_mean, train.mean()),
@@ -113,6 +119,7 @@ def benchmark_per_rail(ts_data, target_name, split_date='2023-03-15 23:00:00', h
     
     df_bench = pd.DataFrame(bench_results).T
     
+    # Print summary stats
     print(f"Processed {len(bench_results)} rails. Stats:")
     print(df_bench.describe().round(4).loc[['mean', 'std', 'min', 'max']])
     return df_bench
@@ -126,7 +133,7 @@ def benchmark_fleet(ts_series, target_name, split_date='2023-03-15 23:00:00', h_
     
     split_datetime = pd.to_datetime(split_date)
     
-    # 1. Cross-validation
+    # 1. Run Cross-validation for robust error estimation on past data
     cv_naive = rolling_window_cv(ts_series, naive, h_ahead=h_ahead, n_splits=10)
     cv_mean = rolling_window_cv(ts_series, mean_fc, h_ahead=h_ahead, n_splits=10)
     cv_snai = rolling_window_cv(ts_series, seasonal_naive, h_ahead=h_ahead, n_splits=10)
@@ -136,12 +143,13 @@ def benchmark_fleet(ts_series, target_name, split_date='2023-03-15 23:00:00', h_
     print(f"  Mean:    {np.nanmean(cv_mean['nmae']):.4f} ± {np.nanstd(cv_mean['nmae']):.4f}")
     print(f"  S_Naive: {np.nanmean(cv_snai['nmae']):.4f} ± {np.nanstd(cv_snai['nmae']):.4f}")
     
-    # 2. Single Test set evaluation
+    # 2. Run evaluation on the specific Held-Out Test set
     train = ts_series.loc[:split_date]
     test = ts_series.loc[split_datetime + pd.Timedelta(hours=1):].iloc[:h_ahead]
     
     if len(test) >= h_ahead:
         y_true = test.values
+        # Compare all benchmarks on the specific test window
         nmae_naive = calculate_nmae(y_true, naive(train, h_ahead).values.ravel(), train.mean())
         nmae_mean = calculate_nmae(y_true, mean_fc(train, h_ahead).values.ravel(), train.mean())
         nmae_snai = calculate_nmae(y_true, seasonal_naive(train, h_ahead).values.ravel(), train.mean())
@@ -163,6 +171,7 @@ def plot_fleet_forecast(ts_series, split_date='2023-03-15 23:00:00', h_ahead=24,
     fig, ax = plt.subplots(figsize=(14, 6))
     hours = np.arange(h_ahead)
     
+    # Plot actuals vs all benchmark forecasts
     ax.plot(hours, test.values, marker='o', label='Actual', linewidth=2.5, 
             color='black', markersize=6, zorder=5)
     ax.plot(hours, y_naive, linestyle='--', label='Naive', linewidth=1.8, alpha=0.8)
@@ -183,16 +192,17 @@ def plot_fleet_forecast(ts_series, split_date='2023-03-15 23:00:00', h_ahead=24,
 # PROBABILISTIC FORECAST (RESIDUAL BASED)
 # ============================================================================
 
-def compute_prediction_intervals(ts_series, model_func, split_date='2023-03-15 23:00:00', 
-                                 h_ahead=24, n_splits=10, quantiles=[0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95]):
+def compute_prediction_intervals(ts_series, model_func, split_date='2023-03-15 23:00:00', h_ahead=24, n_splits=10, quantiles=[0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95]):
     """
     Computes prediction intervals based on historical residuals from Cross-Validation.
+    This method assumes that future errors will follow the same distribution as past errors.
     """
     split_datetime = pd.to_datetime(split_date)
     all_residuals = []
     
     step = (len(ts_series) - h_ahead) // (n_splits + 1)
     
+    # Collect residuals from multiple past folds
     for i in range(n_splits):
         train_end_idx = len(ts_series) - h_ahead - (n_splits - i) * step
         train = ts_series.iloc[:train_end_idx]
@@ -203,10 +213,13 @@ def compute_prediction_intervals(ts_series, model_func, split_date='2023-03-15 2
         
         y_pred = model_func(train, h_ahead).values.ravel()
         y_true = test.values
+        # Store residual: Actual - Predicted
         all_residuals.append(y_true - y_pred)
     
+    # Concatenate all residuals into one large distribution
     all_residuals = np.concatenate(all_residuals)
     
+    # Calculate empirical quantiles from this distribution
     quantile_dict = {}
     for q in quantiles:
         quantile_dict[f'q{int(q*100)}'] = np.quantile(all_residuals, q)
@@ -222,6 +235,7 @@ def compute_prediction_intervals(ts_series, model_func, split_date='2023-03-15 2
 def probabilistic_forecast_fleet(ts_series, target_name='Consumption', split_date='2023-03-15 23:00:00', h_ahead=24):
     """
     Generates a probabilistic forecast for the fleet.
+    Logic: Point Forecast + Empirical Quantile of Residuals.
     """
     print(f"PROBABILISTIC - {target_name.upper()}")
     
@@ -229,15 +243,15 @@ def probabilistic_forecast_fleet(ts_series, target_name='Consumption', split_dat
     train = ts_series.loc[:split_date]
     test = ts_series.loc[split_datetime + pd.Timedelta(hours=1):].iloc[:h_ahead]
     
-    # Point forecast
+    # 1. Generate standard point forecast (Seasonal Naive)
     y_point = seasonal_naive(train, h_ahead).values.ravel()
     
-    # Compute residual distribution
+    # 2. Compute error distribution from history
     residual_stats = compute_prediction_intervals(
         ts_series, seasonal_naive, split_date, h_ahead, n_splits=10
     )
     
-    # Add residuals to point forecast
+    # 3. Add error quantiles to point forecast to create prediction intervals
     q = residual_stats['quantiles']
     
     print(f"Residuals | Mean: {residual_stats['mean_residual']:.4f} | Std: {residual_stats['std_residual']:.4f}")
@@ -265,7 +279,7 @@ def plot_probabilistic_forecast(ts_series, target_name='Consumption', split_date
     
     fig, ax = plt.subplots(figsize=(14, 7))
     
-    # Fan chart shading
+    # Fan chart shading: Darker for higher confidence (closer to median), lighter for tails
     ax.fill_between(hours, fc['lower_5'], fc['upper_95'], alpha=0.1, 
                     color='blue', label='90% PI')
     ax.fill_between(hours, fc['lower_10'], fc['upper_10'], alpha=0.15, 
@@ -303,7 +317,7 @@ def print_probabilistic_summary(fc_result, h_ahead=24):
     
     print(f"First 5 hours:\n{df_summary.head().round(2)}")
     
-    # Coverage
+    # Calculate coverage: Proportion of actuals that fell inside the prediction intervals
     cov_80 = np.sum((fc_result['actual'] >= fc_result['lower_10']) & (fc_result['actual'] <= fc_result['upper_10']))
     cov_90 = np.sum((fc_result['actual'] >= fc_result['lower_5']) & (fc_result['actual'] <= fc_result['upper_95']))
     
@@ -321,9 +335,6 @@ def train_chronos2_fleet(fleet_ts, target_name='consumption', split_date='2023-0
     """
     Uses the Chronos 2 foundation model for fleet-level forecasting.
     """
-    
-    if BaseChronosPipeline is None:
-        return None
 
     try:
         pipeline = BaseChronosPipeline.from_pretrained("amazon/chronos-2", device_map="cpu")
@@ -342,14 +353,16 @@ def train_chronos2_fleet(fleet_ts, target_name='consumption', split_date='2023-0
         return None
     
     try:
-        # Prepare context
+        # Prepare context DataFrame in the specific format required by Chronos
+        # Needs 'target' column, 'timestamp', and 'item_id' (grouping key)
         df_context = pd.DataFrame({
             'Date Time': train.index,
             'item_id': 'ev_fleet',
             target_name: train.values
         }).reset_index(drop=True)
         
-        # Inference
+        # Inference step
+        # We request specific quantiles to understand model uncertainty
         cron_pred_df = pipeline.predict_df(
             df_context,
             prediction_length=h_ahead,
@@ -359,6 +372,7 @@ def train_chronos2_fleet(fleet_ts, target_name='consumption', split_date='2023-0
             target=target_name,
         )
         
+        # Extract median (0.5) as the point forecast
         y_chronos = cron_pred_df['0.5'].values
         y_test = test.values
         mae = mean_absolute_error(y_test, y_chronos)
@@ -395,6 +409,7 @@ def train_chronos2_per_rail(ts_data, target_name='consumption', split_date='2023
     except Exception:
         return None, None
     
+    # Loop over columns with a progress bar (tqdm)
     for rail in tqdm(ts_data.columns, desc='Rails', leave=False):
         ts = ts_data[rail]
         train = ts.loc[:split_date]
@@ -404,12 +419,14 @@ def train_chronos2_per_rail(ts_data, target_name='consumption', split_date='2023
             continue
         
         try:
+            # Format dataframe for single-item prediction
             df_context = pd.DataFrame({
                 'Date Time': train.index, 'item_id': rail, target_name: train.values
             }).reset_index(drop=True)
             df_context['Date Time'] = pd.to_datetime(df_context['Date Time'])
             df_context.sort_values('Date Time', inplace=True)
             
+            # Predict with explicit 'freq' to aid tokenizer
             cron_pred_df = pipeline.predict_df(
                 df_context, prediction_length=h_ahead, quantile_levels=[0.5],
                 id_column="item_id", timestamp_column="Date Time", target=target_name, freq='1h'
@@ -433,9 +450,6 @@ def train_chronos2_per_rail(ts_data, target_name='consumption', split_date='2023
 
 def probabilistic_forecast_chronos2(fleet_ts, target_name='Consumption', split_date='2023-03-15 23:00:00', h_ahead=24):
     """Probabilistic forecast using Chronos 2 native quantiles."""
-    
-    if BaseChronosPipeline is None:
-        return None
 
     print(f"PROB FORECAST (CHRONOS) - {target_name.upper()}")
     split_datetime = pd.to_datetime(split_date)
@@ -448,6 +462,7 @@ def probabilistic_forecast_chronos2(fleet_ts, target_name='Consumption', split_d
             'Date Time': train.index, 'item_id': 'ev_fleet', target_name.lower(): train.values
         }).reset_index(drop=True)
         
+        # Request a full spread of quantiles for the fan chart
         cron_pred_df = pipeline.predict_df(
             df_context, prediction_length=h_ahead, 
             quantile_levels=[0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95],
@@ -480,6 +495,7 @@ def plot_probabilistic_forecast_chronos2(ts_series, target_name='Consumption', s
     hours = np.arange(h_ahead)
     fig, ax = plt.subplots(figsize=(14, 7))
     
+    # Plot confidence intervals as shaded regions
     ax.fill_between(hours, fc['lower_5'], fc['upper_95'], alpha=0.1, color='blue', label='90% PI')
     ax.fill_between(hours, fc['lower_10'], fc['upper_10'], alpha=0.15, color='blue', label='80% PI')
     ax.fill_between(hours, fc['lower_25'], fc['upper_25'], alpha=0.2, color='blue', label='50% PI')
@@ -521,12 +537,12 @@ def compare_all_models_w_chronos2(fleet_ts, target_name='Consumption', split_dat
     
     results = {}
     
-    # S_Naive
+    # S_Naive - Baseline
     y_snai = seasonal_naive(train, 24).values.ravel()
     results['S_Naive'] = {'nMAE': calculate_nmae(test.values, y_snai, train.mean())}
     print(f"  S_Naive:  nMAE={results['S_Naive']['nMAE']:.4f}")
     
-    # ARIMA
+    # ARIMA - Classical Statistical Method
     try:
         from statsmodels.tsa.arima.model import ARIMA
         model = ARIMA(train, order=(2, 1, 2)).fit()
@@ -536,7 +552,7 @@ def compare_all_models_w_chronos2(fleet_ts, target_name='Consumption', split_dat
     except:
         print("  ARIMA:    Failed")
     
-    # Chronos
+    # Chronos - Deep Learning / Foundation Model
     if BaseChronosPipeline:
         c_res = train_chronos2_fleet(fleet_ts, target_name.lower(), split_date)
         if c_res:
@@ -553,21 +569,23 @@ def compare_all_models_w_chronos2(fleet_ts, target_name='Consumption', split_dat
 
 def predict_future_chronos2(ts_data, target_name, h_ahead=24):
     """Predicts future values using Chronos 2."""
-    if BaseChronosPipeline is None: return None
 
     try:
         pipeline = BaseChronosPipeline.from_pretrained("amazon/chronos-2", device_map="cpu")
         print(f"FUTURE FORECAST ({h_ahead}h) - {target_name.upper()}")
         
+        # Build context from entire available history
         context_df = pd.DataFrame({
             'Date Time': pd.to_datetime(ts_data.index), 'item_id': 'ev_fleet', target_name: ts_data.values
         }).reset_index(drop=True)
         
+        # Predict unknown future
         future_predictions_df = pipeline.predict_df(
             context_df, prediction_length=h_ahead, quantile_levels=[0.1, 0.25, 0.5, 0.75, 0.9],
             id_column="item_id", timestamp_column="Date Time", target=target_name
         )
         
+        # Assign future timestamp index
         future_predictions_df.index = pd.date_range(ts_data.index[-1] + pd.Timedelta(hours=1), periods=h_ahead, freq='h')
         print(future_predictions_df[['0.5']].rename(columns={'0.5': 'Median'}).head())
         return future_predictions_df
@@ -581,6 +599,7 @@ def plot_future_forecast(ts_data, forecast_df, target_name):
     plt.figure(figsize=(15, 7))
     plt.plot(ts_data.index, ts_data.values, label='History', color='black', alpha=0.8)
     
+    # Plot confidence intervals if available
     if '0.1' in forecast_df.columns:
         plt.fill_between(forecast_df.index, forecast_df['0.1'], forecast_df['0.9'], color='skyblue', alpha=0.4, label='80% PI')
     if '0.25' in forecast_df.columns:

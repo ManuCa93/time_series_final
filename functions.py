@@ -428,6 +428,7 @@ def train_lgbm_fleet(ts_series, target_name='consumption', split_date='2023-03-1
     return {
         'model': model,
         'y_pred': y_pred,
+        'y_true': y_true,
         'mae': mae,
         'nmae': nmae,
         'feature_importance': pd.Series(model.feature_importances_, index=X_train.columns)

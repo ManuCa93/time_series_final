@@ -1,9 +1,11 @@
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+import seaborn as sns
 from sklearn.metrics import mean_absolute_error
 from tqdm import tqdm
 from chronos import BaseChronosPipeline
+import lightgbm as lgb
 
 # ============================================================================
 # BASIC UTILS & BENCHMARK MODELS
@@ -139,9 +141,9 @@ def benchmark_fleet(ts_series, target_name, split_date='2023-03-15 23:00:00', h_
     cv_snai = rolling_window_cv(ts_series, seasonal_naive, h_ahead=h_ahead, n_splits=10)
     
     print("CV (10-fold) nMAE:")
-    print(f"  Naive:   {np.nanmean(cv_naive['nmae']):.4f} ± {np.nanstd(cv_naive['nmae']):.4f}")
-    print(f"  Mean:    {np.nanmean(cv_mean['nmae']):.4f} ± {np.nanstd(cv_mean['nmae']):.4f}")
-    print(f"  S_Naive: {np.nanmean(cv_snai['nmae']):.4f} ± {np.nanstd(cv_snai['nmae']):.4f}")
+    print(f"  Naive:   {np.nanmean(cv_naive['nmae']):.4f} +- {np.nanstd(cv_naive['nmae']):.4f}")
+    print(f"  Mean:    {np.nanmean(cv_mean['nmae']):.4f} +- {np.nanstd(cv_mean['nmae']):.4f}")
+    print(f"  S_Naive: {np.nanmean(cv_snai['nmae']):.4f} +- {np.nanstd(cv_snai['nmae']):.4f}")
     
     # 2. Run evaluation on the specific Held-Out Test set
     train = ts_series.loc[:split_date]
@@ -326,6 +328,151 @@ def print_probabilistic_summary(fc_result, h_ahead=24):
     print(f"Coverage | 80% PI: {100*cov_80/h_ahead:.1f}% | 90% PI: {100*cov_90/h_ahead:.1f}%")
     print(f"Avg Width (80% PI): {width_80:.2f}")
 
+# ============================================================================
+# ML SECTION - LIGHTGBM
+# ============================================================================
+
+def make_features(df, lags=[24, 168]):
+    """Creates lag features for LightGBM."""
+    df = df.copy()
+    if isinstance(df, pd.Series):
+        df = df.to_frame(name='target')
+    else:
+        df.columns = ['target']
+
+    # Temporal features
+    df['hour'] = df.index.hour
+    df['dayofweek'] = df.index.dayofweek
+    df['is_weekend'] = df['dayofweek'].isin([5, 6]).astype(int)
+
+    # Lag features
+    for lag in lags:
+        df[f'lag_{lag}'] = df['target'].shift(lag)
+    
+    return df.dropna()
+
+def train_lgbm_fleet(ts_series, target_name='consumption', split_date='2023-03-15 23:00:00', h_ahead=24):
+    """
+    Trains a LightGBM regressor using a recursive forecasting strategy.
+    """
+    print(f"LIGHTGBM - {target_name.upper()}")
+    
+    # 1. Feature Engineering
+    df_features = make_features(ts_series, lags=[24, 168])
+    
+    # 2. Train/Test Split
+    split_datetime = pd.to_datetime(split_date)
+    train_data = df_features.loc[:split_date]
+    test_data = df_features.loc[split_datetime + pd.Timedelta(hours=1):] # This might be empty for future forecast
+    
+    if len(train_data) == 0:
+        return None
+
+    X_train = train_data.drop(columns=['target'])
+    y_train = train_data['target']
+    
+    # 3. Model Training
+    model = lgb.LGBMRegressor(n_estimators=500, learning_rate=0.05, random_state=42, verbose=-1)
+    model.fit(X_train, y_train)
+    
+    # 4. Recursive Forecasting for Test Set (h_ahead)
+    # We need to predict step-by-step because lags depend on previous predictions
+    predictions = []
+    
+    # Start with the last known row before the test set
+    last_window = ts_series.loc[:split_date].copy()
+    
+    current_time = split_datetime + pd.Timedelta(hours=1)
+    
+    for _ in range(h_ahead):
+        # Create a single row dataframe for the current timestamp
+        future_row = pd.DataFrame(index=[current_time])
+        future_row['hour'] = current_time.hour
+        future_row['dayofweek'] = current_time.dayofweek
+        future_row['is_weekend'] = int(current_time.dayofweek in [5, 6])
+        
+        # Calculate lags based on 'last_window' history
+        # Note: for recursive strategy, we append predictions to 'last_window'
+        future_row['lag_24'] = last_window.shift(24).iloc[-1] if len(last_window) >= 24 else np.nan # Simplified: grabbing index -24
+        # A more robust way:
+        val_lag24 = last_window.loc[current_time - pd.Timedelta(hours=24)] if (current_time - pd.Timedelta(hours=24)) in last_window.index else np.nan
+        val_lag168 = last_window.loc[current_time - pd.Timedelta(hours=168)] if (current_time - pd.Timedelta(hours=168)) in last_window.index else np.nan
+        
+        future_row['lag_24'] = val_lag24
+        future_row['lag_168'] = val_lag168
+        
+        # Predict
+        pred_val = model.predict(future_row)[0]
+        # Ensure non-negative for consumption/presence
+        pred_val = max(0, pred_val) 
+        
+        predictions.append(pred_val)
+        
+        # Append prediction to history so next step can use it as a lag
+        last_window = pd.concat([last_window, pd.Series([pred_val], index=[current_time])])
+        current_time += pd.Timedelta(hours=1)
+    
+    # Evaluation (if ground truth exists)
+    y_pred = np.array(predictions)
+    mae, nmae = np.nan, np.nan
+    
+    # Get ground truth for the forecast horizon
+    ground_truth = ts_series.loc[split_datetime + pd.Timedelta(hours=1):].iloc[:h_ahead]
+    
+    if len(ground_truth) == h_ahead:
+        y_true = ground_truth.values
+        mae = mean_absolute_error(y_true, y_pred)
+        nmae = calculate_nmae(y_true, y_pred, y_train.mean())
+        print(f"Result | MAE: {mae:.4f} | nMAE: {nmae:.4f}")
+    
+    return {
+        'model': model,
+        'y_pred': y_pred,
+        'mae': mae,
+        'nmae': nmae,
+        'feature_importance': pd.Series(model.feature_importances_, index=X_train.columns)
+    }
+
+def plot_lgbm_feature_importance(lgbm_results, target_name='Consumption'):
+    """Plots feature importance for LightGBM."""
+    if lgbm_results is None:
+        print("No LightGBM results to plot.")
+        return
+
+    importance = lgbm_results['feature_importance'].sort_values(ascending=False)
+    
+    plt.figure(figsize=(10, 5))
+    sns.barplot(x=importance.values, y=importance.index, palette='viridis', hue=importance.index, legend=False)
+    plt.title(f'LightGBM Feature Importance ({target_name})', fontsize=14)
+    plt.xlabel('Importance (Split Gain)')
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+    
+    print("Interpretation: 'lag_24' and 'hour' should be the most important features, confirming the daily seasonality.")
+
+def plot_lgbm_predictions(lgbm_results, target_name='Consumption'):
+    """Plots LightGBM prediction vs Actual."""
+    if lgbm_results is None or lgbm_results.get('y_true') is None:
+        print("No LightGBM results or ground truth to plot.")
+        return
+
+    y_true = lgbm_results['y_true']
+    y_pred = lgbm_results['y_pred']
+    hours = np.arange(len(y_true))
+    
+    plt.figure(figsize=(14, 6))
+    plt.plot(hours, y_true, marker='o', color='black', label='Actual', linewidth=2.5, zorder=5)
+    plt.plot(hours, y_pred, color='green', label='LightGBM', linewidth=2, linestyle='--')
+    
+    plt.title(f'LightGBM Performance: Actual vs Forecast - {target_name}', fontsize=14, fontweight='bold')
+    plt.xlabel('Hours Ahead (Test Set)')
+    plt.ylabel(target_name)
+    plt.legend(loc='best')
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
 
 # ============================================================================
 # ML SECTION - CHRONOS 2
@@ -484,8 +631,7 @@ def probabilistic_forecast_chronos2(fleet_ts, target_name='Consumption', split_d
     except Exception as e:
         print(f"Error: {str(e)[:100]}")
         return None
-
-
+    
 def plot_probabilistic_forecast_chronos2(ts_series, target_name='Consumption', split_date='2023-03-15 23:00:00', h_ahead=24):
     """Plot fan chart using Chronos 2 generated quantiles."""
     
@@ -552,6 +698,15 @@ def compare_all_models_w_chronos2(fleet_ts, target_name='Consumption', split_dat
     except:
         print("  ARIMA:    Failed")
     
+    # 3. LightGBM - Classic ML (ADDED)
+    try:
+        lgbm_res = train_lgbm_fleet(fleet_ts, target_name.lower(), split_date)
+        if lgbm_res:
+             results['LightGBM'] = {'nMAE': lgbm_res['nmae']}
+             print(f"  LightGBM: nMAE={results['LightGBM']['nMAE']:.4f}")
+    except Exception as e:
+        print(f"  LightGBM: Failed ({str(e)[:50]})")
+
     # Chronos - Deep Learning / Foundation Model
     if BaseChronosPipeline:
         c_res = train_chronos2_fleet(fleet_ts, target_name.lower(), split_date)
@@ -612,3 +767,54 @@ def plot_future_forecast(ts_data, forecast_df, target_name):
     plt.grid(True, linestyle='--', linewidth=0.5)
     plt.tight_layout()
     plt.show()
+
+def predict_future_snaive(ts_data, target_name, h_ahead=24):
+    """
+    Predicts future values using Seasonal Naive strategy (Repeating the last 24h).
+    Useful for 'Presence' where the baseline is strong.
+    """
+    print(f"FUTURE FORECAST (S_NAIVE) - {target_name.upper()}")
+    
+    last_cycle = ts_data.iloc[-24:].values
+    
+    y_pred = np.tile(last_cycle, int(np.ceil(h_ahead/24)))[:h_ahead]
+    
+    future_idx = pd.date_range(start=ts_data.index[-1] + pd.Timedelta(hours=1), periods=h_ahead, freq='h')
+    
+    df_future = pd.DataFrame(index=future_idx)
+    df_future['0.5'] = y_pred  # Mediana = Previsione puntuale
+    df_future['0.1'] = y_pred  # Lower bound (fittizio, collassa sul valore)
+    df_future['0.9'] = y_pred  # Upper bound (fittizio)
+    
+    print(f"S_Naive Forecast Generated. First 5 values:\n{df_future.head()}")
+    return df_future
+
+def print_forecast_report(forecast_df, target_name, model_name="Chronos"):
+    """Prints a professional report for the Grid Operator."""
+    
+    total_median = forecast_df['0.5'].sum()
+    total_low = forecast_df['0.1'].sum()
+    total_high = forecast_df['0.9'].sum()
+    
+    print("\n" + "="*60)
+    print(f"OPERATIONAL REPORT: NEXT 24H - {target_name.upper()} ({model_name})")
+    print("="*60)
+    
+    if target_name.lower() == 'consumption':
+        print(f"Expected Total Load:   {total_median:.2f} kWh")
+        if model_name == "Chronos":
+            print(f"Probabilistic Range:   [{total_low:.2f} kWh  -  {total_high:.2f} kWh] (80% Conf.)")
+            print("-" * 60)
+            print("INTERPRETATION FOR GRID OPERATOR:")
+            print(f"• Plan for {total_median:.0f} kWh. Reserve capacity for peak of {total_high:.0f} kWh.")
+        else:
+            print("(Deterministic Forecast - No Uncertainty Range)")
+            
+    elif target_name.lower() == 'presence':
+        peak_cars = forecast_df['0.5'].max()
+        print(f"Expected Peak Occupancy: {peak_cars:.1f} vehicles")
+        print("-" * 60)
+        print("INTERPRETATION:")
+        print(f"• Expect parking to reach max occupancy of around {int(peak_cars)} cars.")
+        
+    print("="*60 + "\n")

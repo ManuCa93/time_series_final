@@ -41,7 +41,9 @@ def calculate_nmae(y_true, y_pred, y_train_mean):
     Lower is better. < 1 means we beat the baseline.
     """
     mae = np.mean(np.abs(y_true - y_pred))
-    mae_baseline = np.mean(np.abs(y_true - np.mean(y_true)))  
+    # mae_baseline = np.mean(np.abs(y_true - np.mean(y_true)))
+    mae_baseline = np.mean(np.abs(y_true - y_train_mean))
+  
     return mae / mae_baseline if mae_baseline != 0 else np.nan
 
 def rolling_window_cv(ts_series, model_func, h_ahead=24, n_splits=10):
@@ -578,7 +580,7 @@ def probabilistic_forecast_chronos2(fleet_ts, target_name='Consumption', split_d
             'Date Time': train.index, 'item_id': 'ev_fleet', target_name.lower(): train.values
         }).reset_index(drop=True)
         
-        # Request lots of quantiles for a detailed fan chart
+        # lots of quantiles for a detailed fan chart
         cron_pred_df = pipeline.predict_df(
             df_context, prediction_length=h_ahead, 
             quantile_levels=[0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95],
@@ -643,7 +645,7 @@ def print_probabilistic_summary_chronos2(fc_result, h_ahead=24):
 
 def compare_all_models_w_chronos2(fleet_ts, target_name='Consumption', split_date='2023-03-15 23:00:00'):
     """
-    Battle of the models! Tests S_Naive, ARIMA, LightGBM, and Chronos.
+    All model compared: Tests S_Naive, ARIMA, LightGBM, and Chronos.
     Shows which one performs best on the test set.
     """
     
@@ -666,9 +668,9 @@ def compare_all_models_w_chronos2(fleet_ts, target_name='Consumption', split_dat
         model = ARIMA(train, order=(2, 1, 2)).fit()
         y_arima = model.forecast(steps=24).values
         results['ARIMA'] = {'nMAE': calculate_nmae(test.values, y_arima, train.mean())}
-        print(f"  ARIMA:    nMAE={results['ARIMA']['nMAE']:.4f}")
+        print(f"  ARIMA: nMAE={results['ARIMA']['nMAE']:.4f}")
     except:
-        print("  ARIMA:    Failed")
+        print("  ARIMA: Failed")
     
     # Gradient boosting
     try:
@@ -685,7 +687,7 @@ def compare_all_models_w_chronos2(fleet_ts, target_name='Consumption', split_dat
         if c_res:
             results['Chronos2'] = {'nMAE': c_res['nmae']}
     
-    # Declare a winner
+    # select best one
     if results:
         df_res = pd.DataFrame(results).T.sort_values('nMAE')
         best = df_res.index[0]
@@ -698,7 +700,6 @@ def compare_all_models_w_chronos2(fleet_ts, target_name='Consumption', split_dat
 def predict_future_chronos2(ts_data, target_name, h_ahead=24):
     """
     Predicts the actual future (no test set) using Chronos.
-    This is what you'd use for real operational forecasting.
     """
 
     try:
@@ -716,7 +717,7 @@ def predict_future_chronos2(ts_data, target_name, h_ahead=24):
             id_column="item_id", timestamp_column="Date Time", target=target_name
         )
         
-        # Give it proper future timestamps
+        #give right future timestamps
         future_predictions_df.index = pd.date_range(ts_data.index[-1] + pd.Timedelta(hours=1), periods=h_ahead, freq='h')
         print(future_predictions_df[['0.5']].rename(columns={'0.5': 'Median'}).head())
         return future_predictions_df
@@ -730,7 +731,7 @@ def plot_future_forecast(ts_data, forecast_df, target_name):
     plt.figure(figsize=(15, 7))
     plt.plot(ts_data.index, ts_data.values, label='History', color='black', alpha=0.8)
     
-    # Add confidence bands if they exist
+    # add confidence interval if exists
     if '0.1' in forecast_df.columns:
         plt.fill_between(forecast_df.index, forecast_df['0.1'], forecast_df['0.9'], color='skyblue', alpha=0.4, label='80% PI')
     if '0.25' in forecast_df.columns:
@@ -769,17 +770,16 @@ def predict_future_snaive(ts_data, target_name, h_ahead=24):
 
 def print_forecast_report(forecast_df, target_name, model_name="Chronos"):
     """
-    Generates a nice summary report that you could show to a grid operator.
-    Gives totals, ranges, and actionable interpretation.
+    Generates a report of totals, ranges, and actionable interpretation.
     """
     
     total_median = forecast_df['0.5'].sum()
     total_low = forecast_df['0.1'].sum()
     total_high = forecast_df['0.9'].sum()
     
-    print("\n" + "="*60)
+    print("\n" + "="*80)
     print(f"OPERATIONAL REPORT: NEXT 24H - {target_name.upper()} ({model_name})")
-    print("="*60)
+    print("="*80)
     
     if target_name.lower() == 'consumption':
         print(f"Expected Total Load:   {total_median:.2f} kWh")
@@ -798,4 +798,4 @@ def print_forecast_report(forecast_df, target_name, model_name="Chronos"):
         print("INTERPRETATION:")
         print(f"• Expect parking to reach max occupancy of around {int(peak_cars)} cars.")
         
-    print("="*60 + "\n")
+    print("="*80 + "\n")
